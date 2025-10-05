@@ -1,26 +1,94 @@
 #include "LS7166.h"
+#include "I2CComm.h"
+#include "PIDController.h"
 #include <Arduino_FreeRTOS.h>
 #include <Servo.h>
 #include <semphr.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <avr/wdt.h>  // Watchdog timer library
 
-// Pin definitions
-#define MOTOR1_EN1 2
-#define MOTOR1_EN2 3
-#define MOTOR2_EN1 4
-#define MOTOR2_EN2 5
-#define SERVO1_PIN 6
-#define SERVO2_PIN 7
-#define SERVO1_NEUTRAL 87
-#define SERVO2_NEUTRAL 92
-#define LS7166_CS1 8
-#define LS7166_CS2 9
+// ============================================================================
+// Pin Definitions and Hardware Configuration
+// ============================================================================
+
+// Motor driver pins (H-Bridge control)
+#define MOTOR1_EN1 2            // Motor 1 direction pin 1
+#define MOTOR1_EN2 3            // Motor 1 direction pin 2
+#define MOTOR2_EN1 4            // Motor 2 direction pin 1
+#define MOTOR2_EN2 5            // Motor 2 direction pin 2
+
+// Servo control pins
+#define SERVO1_PIN 6            // Servo 1 PWM control pin
+#define SERVO2_PIN 7            // Servo 2 PWM control pin
+#define SERVO1_NEUTRAL 87       // Servo 1 neutral position (degrees)
+#define SERVO2_NEUTRAL 92       // Servo 2 neutral position (degrees)
+#define SERVO1_ANGLE_LIMIT 35   // Servo 1 angle range: ±35 degrees from neutral
+#define SERVO2_ANGLE_LIMIT 35   // Servo 2 angle range: ±35 degrees from neutral
+
+// Encoder SPI chip select pins
+#define LS7166_CS1 8            // Encoder 1 (Motor 1) CS pin
+#define LS7166_CS2 9            // Encoder 2 (Motor 2) CS pin
+
+// Direction reversal settings
+#define ENCODER1_REVERSE true   // true: reverse encoder direction, false: normal
+#define ENCODER2_REVERSE false  // true: reverse encoder direction, false: normal
+#define MOTOR1_REVERSE false    // true: reverse motor direction, false: normal
+#define MOTOR2_REVERSE false    // true: reverse motor direction, false: normal
+
+// Encoder calibration (adjust these values for your robot)
+// 1m 당 pulse 수 - 확인 해야 함
+#define m_1_pulse 344
+#define m_2_pulse 344
+
+// pulse 당 m - 확인 해야 함
+#define pulse_1_m 1. / 344.
+#define pulse_2_m 1. / 344.
+
+// Speed control frequency: 50Hz (20ms period)
+#define SPEED_CONTROL_FREQ_HZ 50
+#define SPEED_CONTROL_PERIOD_MS (1000 / SPEED_CONTROL_FREQ_HZ)
+
+// 50Hz 제어 주기에서 속도와 Δpulse 변환 값
+#define vel_1_pulse m_1_pulse / 20.
+#define vel_2_pulse m_2_pulse / 20.
+
+// ============================================================================
+// PID Controller Gains
+// ============================================================================
+
+// Motor Speed Control PID (Delta-based, 50Hz)
+#define MOTOR1_SPEED_KP 26.0    // Proportional gain
+#define MOTOR1_SPEED_KI 0.0     // Integral gain
+#define MOTOR1_SPEED_KD 50.0    // Derivative gain
+
+#define MOTOR2_SPEED_KP 26.0    // Proportional gain
+#define MOTOR2_SPEED_KI 0.0     // Integral gain
+#define MOTOR2_SPEED_KD 50.0    // Derivative gain
+
+// Motor Position Control PID
+#define MOTOR1_POS_KP 2.0       // Proportional gain
+#define MOTOR1_POS_KI 0.1       // Integral gain
+#define MOTOR1_POS_KD 10.0      // Derivative gain
+
+#define MOTOR2_POS_KP 2.0       // Proportional gain
+#define MOTOR2_POS_KI 0.1       // Integral gain
+#define MOTOR2_POS_KD 10.0      // Derivative gain
+
+// ============================================================================
+// Watchdog Configuration
+// ============================================================================
+#define WATCHDOG_ENABLE true    // Enable/disable watchdog timer
+#define WATCHDOG_TIMEOUT WDTO_2S // Watchdog timeout: 2 seconds
+                                 // Options: WDTO_15MS, WDTO_30MS, WDTO_60MS, WDTO_120MS,
+                                 //          WDTO_250MS, WDTO_500MS, WDTO_1S, WDTO_2S, WDTO_4S, WDTO_8S
 
 // Control modes
 enum ControlMode
 {
-    MODE_IDLE = 0,
-    MODE_SPEED_CONTROL,
-    MODE_POSITION_CONTROL
+    MODE_PWM = 0,           // Direct PWM control (NO FEEDBACK)
+    MODE_SPEED_CONTROL,     // Speed control with PID
+    MODE_POSITION_CONTROL   // Position control with PID
 };
 
 // Motor control structure
@@ -36,51 +104,54 @@ typedef struct
 // Global objects
 Servo servo1;
 Servo servo2;
-LS7166 encoder(LS7166_CS1, LS7166_CS2);
+LS7166 encoder(LS7166_CS1, LS7166_CS2, ENCODER1_REVERSE, ENCODER2_REVERSE);
+I2CComm i2c;
 
 // Control structures
-MotorControl motor1_ctrl = {0, 0, 0, 0, MODE_IDLE};
-MotorControl motor2_ctrl = {0, 0, 0, 0, MODE_IDLE};
+MotorControl motor1_ctrl = {0, 0, 0, 0, MODE_PWM};
+MotorControl motor2_ctrl = {0, 0, 0, 0, MODE_PWM};
 
 // Semaphores for data protection
 SemaphoreHandle_t xMotor1Semaphore;
 SemaphoreHandle_t xMotor2Semaphore;
 SemaphoreHandle_t xSerialSemaphore;
 
-// PID constants
-const float KP_SPEED = 0.5;
-const float KI_SPEED = 0.1;
-const float KD_SPEED = 0.05;
-
-const float KP_POSITION = 1.0;
-const float KI_POSITION = 0.01;
-const float KD_POSITION = 0.1;
-
-// PID variables for motor 1
-float motor1_speed_error_sum = 0;
-float motor1_speed_last_error = 0;
-float motor1_pos_error_sum = 0;
-float motor1_pos_last_error = 0;
-
-// PID variables for motor 2
-float motor2_speed_error_sum = 0;
-float motor2_speed_last_error = 0;
-float motor2_pos_error_sum = 0;
-float motor2_pos_last_error = 0;
+// PID Controllers (using defined gains)
+PIDController motor1SpeedPID(MOTOR1_SPEED_KP, MOTOR1_SPEED_KI, MOTOR1_SPEED_KD);
+PIDController motor2SpeedPID(MOTOR2_SPEED_KP, MOTOR2_SPEED_KI, MOTOR2_SPEED_KD);
+PIDController motor1PositionPID(MOTOR1_POS_KP, MOTOR1_POS_KI, MOTOR1_POS_KD);
+PIDController motor2PositionPID(MOTOR2_POS_KP, MOTOR2_POS_KI, MOTOR2_POS_KD);
 
 // Function prototypes
-void TaskMotorSpeedControl(void *pvParameters);
-void TaskMotorPositionControl(void *pvParameters);
+void TaskMotorControl(void *pvParameters);
 void TaskSerialCommunication(void *pvParameters);
 
 void motor1_speed_control(int speed);
 void motor2_speed_control(int speed);
-int calculate_speed_pid(float target, float current, float *error_sum, float *last_error);
-int calculate_position_pid(int32_t target, int32_t current, float *error_sum, float *last_error);
+
+// Helper functions
+void setMotorControl(MotorControl *motor_ctrl, SemaphoreHandle_t semaphore, PIDController &speedPID,
+                     PIDController &posPID, void (*speed_control_func)(int), uint8_t mode, int16_t data_s, int32_t data_l);
+void initializeI2C();
+
+// I2C callback functions
+void onDualMotorCommand(uint8_t mode, int16_t m1_data_s, int32_t m1_data_l, int16_t m2_data_s, int32_t m2_data_l);
+void onMotor1Command(uint8_t mode, int16_t data_s, int32_t data_l);
+void onMotor2Command(uint8_t mode, int16_t data_s, int32_t data_l);
+void onDualServoCommand(int8_t servo1_angle, int8_t servo2_angle);
+void onServo1Command(int8_t angle);
+void onServo2Command(int8_t angle);
+void onResetEncodersCommand();
 
 // Motor control functions
 void motor1_speed_control(int speed)
 {
+    // Reverse direction if needed
+    if (MOTOR1_REVERSE)
+    {
+        speed = -speed;
+    }
+
     speed = constrain(speed, -255, 255);
     if (speed > 0)
     {
@@ -101,6 +172,12 @@ void motor1_speed_control(int speed)
 
 void motor2_speed_control(int speed)
 {
+    // Reverse direction if needed
+    if (MOTOR2_REVERSE)
+    {
+        speed = -speed;
+    }
+
     speed = constrain(speed, -255, 255);
     if (speed > 0)
     {
@@ -119,44 +196,14 @@ void motor2_speed_control(int speed)
     }
 }
 
-// PID calculation for speed control
-int calculate_speed_pid(float target, float current, float *error_sum, float *last_error)
-{
-    float error = target - current;
-    *error_sum += error;
-    *error_sum = constrain(*error_sum, -1000, 1000); // Anti-windup
+// PID controllers are now class instances (motor1SpeedPID, motor2SpeedPID, motor1PositionPID, motor2PositionPID)
 
-    float p_term = KP_SPEED * error;
-    float i_term = KI_SPEED * (*error_sum);
-    float d_term = KD_SPEED * (error - *last_error);
-
-    *last_error = error;
-
-    return constrain((int)(p_term + i_term + d_term), -255, 255);
-}
-
-// PID calculation for position control
-int calculate_position_pid(int32_t target, int32_t current, float *error_sum, float *last_error)
-{
-    float error = target - current;
-    *error_sum += error;
-    *error_sum = constrain(*error_sum, -10000, 10000); // Anti-windup
-
-    float p_term = KP_POSITION * error;
-    float i_term = KI_POSITION * (*error_sum);
-    float d_term = KD_POSITION * (error - *last_error);
-
-    *last_error = error;
-
-    return constrain((int)(p_term + i_term + d_term), -255, 255);
-}
-
-// Task 1: Motor Speed Control (10Hz)
-void TaskMotorSpeedControl(void *pvParameters)
+// Task 1: Unified Motor Control (50Hz)
+void TaskMotorControl(void *pvParameters)
 {
     (void)pvParameters;
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(100); // 10Hz
+    const TickType_t xFrequency = pdMS_TO_TICKS(SPEED_CONTROL_PERIOD_MS); // 50Hz (20ms)
 
     int32_t last_enc1 = 0;
     int32_t last_enc2 = 0;
@@ -167,237 +214,147 @@ void TaskMotorSpeedControl(void *pvParameters)
         int32_t current_enc1 = encoder.read_encoder1();
         int32_t current_enc2 = encoder.read_encoder2();
 
-        // Calculate speed (encoder counts per 100ms)
-        int32_t speed1 = current_enc1 - last_enc1;
-        int32_t speed2 = current_enc2 - last_enc2;
+        // Calculate actual delta (encoder counts per 20ms)
+        int32_t actual_delta1 = current_enc1 - last_enc1;
+        int32_t actual_delta2 = current_enc2 - last_enc2;
 
-        last_enc1 = current_enc1;
-        last_enc2 = current_enc2;
-
-        // Motor 1 speed control
+        // Motor 1 control
         if (xSemaphoreTake(xMotor1Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
         {
-            motor1_ctrl.current_speed = speed1;
+            motor1_ctrl.current_speed = actual_delta1;
             motor1_ctrl.current_position = current_enc1;
 
             if (motor1_ctrl.mode == MODE_SPEED_CONTROL)
             {
-                int output = calculate_speed_pid(motor1_ctrl.target_speed, speed1, &motor1_speed_error_sum,
-                                                 &motor1_speed_last_error);
+                // Speed control: Delta-based PID
+                int32_t target_delta1 = (int32_t)(motor1_ctrl.target_speed * vel_1_pulse);
+                int32_t delta_error1 = target_delta1 - actual_delta1;
+
+                motor1SpeedPID.setOutputLimits(-255, 255);
+                int output = (int)motor1SpeedPID.compute((float)delta_error1);
                 motor1_speed_control(output);
             }
+            else if (motor1_ctrl.mode == MODE_POSITION_CONTROL)
+            {
+                // Position control: Position-based PID
+                motor1PositionPID.setOutputLimits(-255, 255);
+                int output = (int)motor1PositionPID.compute(motor1_ctrl.target_position, motor1_ctrl.current_position);
+                motor1_speed_control(output);
+            }
+            else if (motor1_ctrl.mode == MODE_PWM)
+            {
+                // PWM mode: Direct control
+                motor1_speed_control(motor1_ctrl.target_speed);
+            }
+
             xSemaphoreGive(xMotor1Semaphore);
         }
 
-        // Motor 2 speed control
+        // Motor 2 control
         if (xSemaphoreTake(xMotor2Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
         {
-            motor2_ctrl.current_speed = speed2;
+            motor2_ctrl.current_speed = actual_delta2;
             motor2_ctrl.current_position = current_enc2;
 
             if (motor2_ctrl.mode == MODE_SPEED_CONTROL)
             {
-                int output = calculate_speed_pid(motor2_ctrl.target_speed, speed2, &motor2_speed_error_sum,
-                                                 &motor2_speed_last_error);
+                // Speed control: Delta-based PID
+                int32_t target_delta2 = (int32_t)(motor2_ctrl.target_speed * vel_2_pulse);
+                int32_t delta_error2 = target_delta2 - actual_delta2;
+
+                motor2SpeedPID.setOutputLimits(-255, 255);
+                int output = (int)motor2SpeedPID.compute((float)delta_error2);
                 motor2_speed_control(output);
             }
+            else if (motor2_ctrl.mode == MODE_POSITION_CONTROL)
+            {
+                // Position control: Position-based PID
+                motor2PositionPID.setOutputLimits(-255, 255);
+                int output = (int)motor2PositionPID.compute(motor2_ctrl.target_position, motor2_ctrl.current_position);
+                motor2_speed_control(output);
+            }
+            else if (motor2_ctrl.mode == MODE_PWM)
+            {
+                // PWM mode: Direct control
+                motor2_speed_control(motor2_ctrl.target_speed);
+            }
+
             xSemaphoreGive(xMotor2Semaphore);
         }
+
+        // Update previous encoder values
+        last_enc1 = current_enc1;
+        last_enc2 = current_enc2;
+
+        // Reset watchdog timer
+        #if WATCHDOG_ENABLE
+        wdt_reset();
+        #endif
 
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
-// Task 2: Motor Position Control (20Hz)
-void TaskMotorPositionControl(void *pvParameters)
-{
-    (void)pvParameters;
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(50); // 20Hz
-
-    for (;;)
-    {
-        // Motor 1 position control
-        if (xSemaphoreTake(xMotor1Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
-        {
-            if (motor1_ctrl.mode == MODE_POSITION_CONTROL)
-            {
-                int output = calculate_position_pid(motor1_ctrl.target_position, motor1_ctrl.current_position,
-                                                    &motor1_pos_error_sum, &motor1_pos_last_error);
-                motor1_speed_control(output);
-            }
-            else if (motor1_ctrl.mode == MODE_IDLE)
-            {
-                motor1_speed_control(0);
-            }
-            xSemaphoreGive(xMotor1Semaphore);
-        }
-
-        // Motor 2 position control
-        if (xSemaphoreTake(xMotor2Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
-        {
-            if (motor2_ctrl.mode == MODE_POSITION_CONTROL)
-            {
-                int output = calculate_position_pid(motor2_ctrl.target_position, motor2_ctrl.current_position,
-                                                    &motor2_pos_error_sum, &motor2_pos_last_error);
-                motor2_speed_control(output);
-            }
-            else if (motor2_ctrl.mode == MODE_IDLE)
-            {
-                motor2_speed_control(0);
-            }
-            xSemaphoreGive(xMotor2Semaphore);
-        }
-
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    }
-}
-
-// Task 3: Serial Communication (check every 50ms)
+// Task 3: Serial Communication (debug output every 1 second)
 void TaskSerialCommunication(void *pvParameters)
 {
     (void)pvParameters;
-    String inputString = "";
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(1000); // 1Hz (1 second)
 
     for (;;)
     {
+        // Update I2C status and build debug string
+        String status = "M1: ";
+
+        if (xSemaphoreTake(xMotor1Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            i2c.setMotor1Status(motor1_ctrl.current_position, motor1_ctrl.current_speed, motor1_ctrl.mode);
+            status += "Pos=" + String(motor1_ctrl.current_position);
+            status += " Speed=" + String(motor1_ctrl.current_speed);
+            status += " Mode=" + String(motor1_ctrl.mode);
+            xSemaphoreGive(xMotor1Semaphore);
+        }
+
+        status += " | M2: ";
+
+        if (xSemaphoreTake(xMotor2Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            i2c.setMotor2Status(motor2_ctrl.current_position, motor2_ctrl.current_speed, motor2_ctrl.mode);
+            status += "Pos=" + String(motor2_ctrl.current_position);
+            status += " Speed=" + String(motor2_ctrl.current_speed);
+            status += " Mode=" + String(motor2_ctrl.mode);
+            xSemaphoreGive(xMotor2Semaphore);
+        }
+
+        // Add servo positions
+        status += " | S1=" + String(servo1.read());
+        status += " S2=" + String(servo2.read());
+
+        // Debug output
         if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
         {
-            while (Serial.available())
-            {
-                char inChar = (char)Serial.read();
-                if (inChar == '\n')
-                {
-                    // Parse command
-                    // Format: "M1S100" - Motor 1 Speed 100
-                    // Format: "M2P1000" - Motor 2 Position 1000
-                    // Format: "M1I" - Motor 1 Idle
-                    // Format: "RESET" - Reset encoders
-                    // Format: "STATUS" - Get status
-
-                    if (inputString.startsWith("M1S"))
-                    {
-                        // Motor 1 Speed control
-                        int speed = inputString.substring(3).toInt();
-                        if (xSemaphoreTake(xMotor1Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
-                        {
-                            motor1_ctrl.mode = MODE_SPEED_CONTROL;
-                            motor1_ctrl.target_speed = speed;
-                            motor1_speed_error_sum = 0;
-                            motor1_speed_last_error = 0;
-                            xSemaphoreGive(xMotor1Semaphore);
-                        }
-                        Serial.println("M1 Speed: " + String(speed));
-                    }
-                    else if (inputString.startsWith("M2S"))
-                    {
-                        // Motor 2 Speed control
-                        int speed = inputString.substring(3).toInt();
-                        if (xSemaphoreTake(xMotor2Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
-                        {
-                            motor2_ctrl.mode = MODE_SPEED_CONTROL;
-                            motor2_ctrl.target_speed = speed;
-                            motor2_speed_error_sum = 0;
-                            motor2_speed_last_error = 0;
-                            xSemaphoreGive(xMotor2Semaphore);
-                        }
-                        Serial.println("M2 Speed: " + String(speed));
-                    }
-                    else if (inputString.startsWith("M1P"))
-                    {
-                        // Motor 1 Position control
-                        int32_t position = inputString.substring(3).toInt();
-                        if (xSemaphoreTake(xMotor1Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
-                        {
-                            motor1_ctrl.mode = MODE_POSITION_CONTROL;
-                            motor1_ctrl.target_position = position;
-                            motor1_pos_error_sum = 0;
-                            motor1_pos_last_error = 0;
-                            xSemaphoreGive(xMotor1Semaphore);
-                        }
-                        Serial.println("M1 Position: " + String(position));
-                    }
-                    else if (inputString.startsWith("M2P"))
-                    {
-                        // Motor 2 Position control
-                        int32_t position = inputString.substring(3).toInt();
-                        if (xSemaphoreTake(xMotor2Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
-                        {
-                            motor2_ctrl.mode = MODE_POSITION_CONTROL;
-                            motor2_ctrl.target_position = position;
-                            motor2_pos_error_sum = 0;
-                            motor2_pos_last_error = 0;
-                            xSemaphoreGive(xMotor2Semaphore);
-                        }
-                        Serial.println("M2 Position: " + String(position));
-                    }
-                    else if (inputString == "M1I")
-                    {
-                        // Motor 1 Idle
-                        if (xSemaphoreTake(xMotor1Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
-                        {
-                            motor1_ctrl.mode = MODE_IDLE;
-                            xSemaphoreGive(xMotor1Semaphore);
-                        }
-                        Serial.println("M1 Idle");
-                    }
-                    else if (inputString == "M2I")
-                    {
-                        // Motor 2 Idle
-                        if (xSemaphoreTake(xMotor2Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
-                        {
-                            motor2_ctrl.mode = MODE_IDLE;
-                            xSemaphoreGive(xMotor2Semaphore);
-                        }
-                        Serial.println("M2 Idle");
-                    }
-                    else if (inputString == "RESET")
-                    {
-                        encoder.reset_encoders();
-                        Serial.println("Encoders reset");
-                    }
-                    else if (inputString == "STATUS")
-                    {
-                        String status = "M1: ";
-                        if (xSemaphoreTake(xMotor1Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
-                        {
-                            status += "Pos=" + String(motor1_ctrl.current_position);
-                            status += " Speed=" + String(motor1_ctrl.current_speed);
-                            status += " Mode=" + String(motor1_ctrl.mode);
-                            xSemaphoreGive(xMotor1Semaphore);
-                        }
-                        status += " | M2: ";
-                        if (xSemaphoreTake(xMotor2Semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
-                        {
-                            status += "Pos=" + String(motor2_ctrl.current_position);
-                            status += " Speed=" + String(motor2_ctrl.current_speed);
-                            status += " Mode=" + String(motor2_ctrl.mode);
-                            xSemaphoreGive(xMotor2Semaphore);
-                        }
-                        Serial.println(status);
-                    }
-
-                    inputString = "";
-                }
-                else
-                {
-                    inputString += inChar;
-                }
-            }
+            Serial.println(status);
             xSemaphoreGive(xSerialSemaphore);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
 void setup()
 {
+    // Disable watchdog during setup
+    #if WATCHDOG_ENABLE
+    wdt_disable();
+    #endif
+
     Serial.begin(115200);
     while (!Serial)
     {
         ;
     }
+
     // Initialize hardware
     pinMode(MOTOR1_EN1, OUTPUT);
     pinMode(MOTOR1_EN2, OUTPUT);
@@ -412,28 +369,89 @@ void setup()
     // Initialize encoder
     encoder.begin();
 
+    // Reset encoders to 0
+    encoder.reset_encoders();
+    delay(10);
+
+    // SPI Communication Test
+    Serial.println("\n=== SPI Communication Test ===");
+
+    // Test CS pins
+    Serial.print("CS1 Pin ("); Serial.print(LS7166_CS1); Serial.println(") - Testing...");
+    pinMode(LS7166_CS1, OUTPUT);
+    digitalWrite(LS7166_CS1, HIGH);
+    Serial.print("  CS1 HIGH: "); Serial.println(digitalRead(LS7166_CS1));
+    digitalWrite(LS7166_CS1, LOW);
+    Serial.print("  CS1 LOW: "); Serial.println(digitalRead(LS7166_CS1));
+    digitalWrite(LS7166_CS1, HIGH);
+
+    Serial.print("CS2 Pin ("); Serial.print(LS7166_CS2); Serial.println(") - Testing...");
+    pinMode(LS7166_CS2, OUTPUT);
+    digitalWrite(LS7166_CS2, HIGH);
+    Serial.print("  CS2 HIGH: "); Serial.println(digitalRead(LS7166_CS2));
+    digitalWrite(LS7166_CS2, LOW);
+    Serial.print("  CS2 LOW: "); Serial.println(digitalRead(LS7166_CS2));
+    digitalWrite(LS7166_CS2, HIGH);
+
+    // Test SPI pins (Arduino Mega 2560)
+    Serial.println("\nSPI Pins (Mega 2560):");
+    Serial.println("  MOSI (51), MISO (50), SCK (52)");
+    Serial.print("  MISO state: "); Serial.println(digitalRead(50));
+
+    // Raw SPI test
+    Serial.println("\nRaw SPI Communication Test:");
+    digitalWrite(LS7166_CS1, LOW);
+    uint8_t response = SPI.transfer(0x00);
+    digitalWrite(LS7166_CS1, HIGH);
+    Serial.print("  Encoder 1 SPI response to 0x00: 0x");
+    Serial.println(response, HEX);
+
+    digitalWrite(LS7166_CS2, LOW);
+    response = SPI.transfer(0x00);
+    digitalWrite(LS7166_CS2, HIGH);
+    Serial.print("  Encoder 2 SPI response to 0x00: 0x");
+    Serial.println(response, HEX);
+
+    // Verify encoder initialization
+    int32_t test1 = encoder.read_encoder1();
+    int32_t test2 = encoder.read_encoder2();
+    Serial.print("\nEncoder 1 initial value: ");
+    Serial.println(test1);
+    Serial.print("Encoder 2 initial value: ");
+    Serial.println(test2);
+
+    if (test1 == -1 && test2 == -1) {
+        Serial.println("\n!!! WARNING: Both encoders return -1 (0xFFFFFFFF)");
+        Serial.println("!!! This indicates SPI communication failure");
+        Serial.println("!!! Check (Arduino Mega 2560):");
+        Serial.println("!!!   1. MOSI (pin 51) connected to LS7166 DIN");
+        Serial.println("!!!   2. MISO (pin 50) connected to LS7166 DOUT");
+        Serial.println("!!!   3. SCK (pin 52) connected to LS7166 CLK");
+        Serial.println("!!!   4. CS1 (pin 8) connected to Encoder1 CS");
+        Serial.println("!!!   5. CS2 (pin 9) connected to Encoder2 CS");
+        Serial.println("!!!   6. LS7166 power (VCC/GND)");
+    }
+    Serial.println("==============================\n");
+
     // Create semaphores
     xMotor1Semaphore = xSemaphoreCreateMutex();
     xMotor2Semaphore = xSemaphoreCreateMutex();
     xSerialSemaphore = xSemaphoreCreateMutex();
 
+    // Initialize I2C communication
+    initializeI2C();
+
     // Create tasks
-    xTaskCreate(TaskMotorSpeedControl, "SpeedCtrl",
+    xTaskCreate(TaskMotorControl, "MotorCtrl",
                 128, // Stack size
                 NULL,
                 3, // Priority (highest)
                 NULL);
 
-    xTaskCreate(TaskMotorPositionControl, "PosCtrl",
-                128, // Stack size
-                NULL,
-                2, // Priority
-                NULL);
-
     xTaskCreate(TaskSerialCommunication, "SerialComm",
                 256, // Stack size (larger for string handling)
                 NULL,
-                1, // Priority (lowest)
+                2, // Priority
                 NULL);
 
     Serial.println("RTOS Motor Control System Started");
@@ -446,9 +464,115 @@ void setup()
     Serial.println("  M2I - Motor2 idle");
     Serial.println("  RESET - Reset encoders");
     Serial.println("  STATUS - Get current status");
+
+    // Enable watchdog timer (must be last in setup)
+    #if WATCHDOG_ENABLE
+    wdt_enable(WATCHDOG_TIMEOUT);
+    Serial.print("Watchdog enabled with ");
+    Serial.print(WATCHDOG_TIMEOUT == WDTO_2S ? "2" : "?");
+    Serial.println(" second timeout");
+    #endif
 }
 
 void loop()
 {
     // Empty. Things are done in Tasks.
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+void setMotorControl(MotorControl *motor_ctrl, SemaphoreHandle_t semaphore, PIDController &speedPID,
+                     PIDController &posPID, void (*speed_control_func)(int), uint8_t mode, int16_t data_s, int32_t data_l)
+{
+    if (xSemaphoreTake(semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
+    {
+        if (mode == I2C_MODE_PWM)
+        {
+            motor_ctrl->mode = MODE_PWM;
+            motor_ctrl->target_speed = data_s;
+            speed_control_func(data_s);
+        }
+        else if (mode == I2C_MODE_SPEED)
+        {
+            motor_ctrl->mode = MODE_SPEED_CONTROL;
+            motor_ctrl->target_speed = data_s;
+            speedPID.reset();
+        }
+        else if (mode == I2C_MODE_POSITION)
+        {
+            motor_ctrl->mode = MODE_POSITION_CONTROL;
+            motor_ctrl->target_position = data_l;
+            posPID.reset();
+        }
+        xSemaphoreGive(semaphore);
+    }
+}
+
+// ============================================================================
+// I2C Initialization
+// ============================================================================
+
+void initializeI2C()
+{
+    i2c.begin(I2C_SLAVE_ADDRESS);
+    i2c.setDualMotorCallback(onDualMotorCommand);
+    i2c.setMotor1Callback(onMotor1Command);
+    i2c.setMotor2Callback(onMotor2Command);
+    i2c.setDualServoCallback(onDualServoCommand);
+    i2c.setServo1Callback(onServo1Command);
+    i2c.setServo2Callback(onServo2Command);
+    i2c.setResetEncodersCallback(onResetEncodersCommand);
+    Serial.print("I2C initialized at address: 0x");
+    Serial.println(I2C_SLAVE_ADDRESS, HEX);
+}
+
+// ============================================================================
+// I2C Callback Functions
+// ============================================================================
+
+void onDualMotorCommand(uint8_t mode, int16_t m1_data_s, int32_t m1_data_l, int16_t m2_data_s, int32_t m2_data_l)
+{
+    setMotorControl(&motor1_ctrl, xMotor1Semaphore, motor1SpeedPID, motor1PositionPID, motor1_speed_control, mode, m1_data_s, m1_data_l);
+    setMotorControl(&motor2_ctrl, xMotor2Semaphore, motor2SpeedPID, motor2PositionPID, motor2_speed_control, mode, m2_data_s, m2_data_l);
+}
+
+void onMotor1Command(uint8_t mode, int16_t data_s, int32_t data_l)
+{
+    setMotorControl(&motor1_ctrl, xMotor1Semaphore, motor1SpeedPID, motor1PositionPID, motor1_speed_control, mode, data_s, data_l);
+}
+
+void onMotor2Command(uint8_t mode, int16_t data_s, int32_t data_l)
+{
+    setMotorControl(&motor2_ctrl, xMotor2Semaphore, motor2SpeedPID, motor2PositionPID, motor2_speed_control, mode, data_s, data_l);
+}
+
+void onDualServoCommand(int8_t servo1_angle, int8_t servo2_angle)
+{
+    onServo1Command(servo1_angle);
+    onServo2Command(servo2_angle);
+}
+
+void onServo1Command(int8_t angle)
+{
+    // Input range: -SERVO1_ANGLE_LIMIT to +SERVO1_ANGLE_LIMIT degrees
+    // Output: SERVO1_NEUTRAL ± angle
+    int8_t constrained_angle = constrain(angle, -SERVO1_ANGLE_LIMIT, SERVO1_ANGLE_LIMIT);
+    int servo_position = SERVO1_NEUTRAL + constrained_angle;
+    servo1.write(constrain(servo_position, 0, 180));
+}
+
+void onServo2Command(int8_t angle)
+{
+    // Input range: -SERVO2_ANGLE_LIMIT to +SERVO2_ANGLE_LIMIT degrees
+    // Output: SERVO2_NEUTRAL ± angle
+    int8_t constrained_angle = constrain(angle, -SERVO2_ANGLE_LIMIT, SERVO2_ANGLE_LIMIT);
+    int servo_position = SERVO2_NEUTRAL + constrained_angle;
+    servo2.write(constrain(servo_position, 0, 180));
+}
+
+void onResetEncodersCommand()
+{
+    encoder.reset_encoders();
 }

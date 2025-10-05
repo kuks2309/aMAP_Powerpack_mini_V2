@@ -28,13 +28,15 @@ class LS7166 {
 private:
     uint8_t _cs1_pin;
     uint8_t _cs2_pin;
+    bool _enc1_reverse;
+    bool _enc2_reverse;
 
     void write_LS7166(uint8_t cs_pin, uint8_t reg, uint8_t data);
     uint8_t read_LS7166(uint8_t cs_pin, uint8_t reg);
     void init_encoder(uint8_t cs_pin);
 
 public:
-    LS7166(uint8_t cs1_pin, uint8_t cs2_pin);
+    LS7166(uint8_t cs1_pin, uint8_t cs2_pin, bool enc1_reverse = false, bool enc2_reverse = false);
 
     void begin();
 

@@ -1,14 +1,16 @@
 #include "LS7166.h"
 
-LS7166::LS7166(uint8_t cs1_pin, uint8_t cs2_pin) {
+LS7166::LS7166(uint8_t cs1_pin, uint8_t cs2_pin, bool enc1_reverse, bool enc2_reverse) {
     _cs1_pin = cs1_pin;
     _cs2_pin = cs2_pin;
+    _enc1_reverse = enc1_reverse;
+    _enc2_reverse = enc2_reverse;
 }
 
 void LS7166::begin() {
     // Initialize SPI
     SPI.begin();
-    SPI.setClockDivider(SPI_CLOCK_DIV8);
+    SPI.setClockDivider(SPI_CLOCK_DIV16); // Slower clock for stability
     SPI.setDataMode(SPI_MODE0);
     SPI.setBitOrder(MSBFIRST);
 
@@ -18,8 +20,14 @@ void LS7166::begin() {
     digitalWrite(_cs1_pin, HIGH);
     digitalWrite(_cs2_pin, HIGH);
 
+    // Small delay for CS pins to stabilize
+    delay(10);
+
     // Initialize both encoders
     init_encoders();
+
+    // Small delay after initialization
+    delay(10);
 }
 
 void LS7166::write_LS7166(uint8_t cs_pin, uint8_t reg, uint8_t data) {
@@ -39,16 +47,11 @@ uint8_t LS7166::read_LS7166(uint8_t cs_pin, uint8_t reg) {
 }
 
 void LS7166::init_encoder(uint8_t cs_pin) {
-    // Configure MDR0: 4X quadrature, free running, index disabled
-    write_LS7166(cs_pin, MCR_MDR0, 0x00);
-    write_LS7166(cs_pin, MDR0, 0x03);
-
-    // Configure MDR1: 32-bit counter, enable counting
-    write_LS7166(cs_pin, MCR_MDR1, 0x00);
-    write_LS7166(cs_pin, MDR1, 0x00);
-
-    // Clear counter
-    write_LS7166(cs_pin, CMD, CLR_CNTR);
+    // Configure MDR0: 4X quadrature, free running mode (same as working example)
+    digitalWrite(cs_pin, LOW);
+    SPI.transfer(0x88); // Write to MDR0
+    SPI.transfer(0x03); // Configure to 4 byte mode
+    digitalWrite(cs_pin, HIGH);
 }
 
 void LS7166::init_encoder1() {
@@ -65,47 +68,85 @@ void LS7166::init_encoders() {
 }
 
 int32_t LS7166::read_encoder1() {
-    int32_t count = 0;
+    unsigned int count_1, count_2, count_3, count_4;
+    int32_t count_value;
 
-    // Latch counter to output register
-    write_LS7166(_cs1_pin, CMD, LATCH_CNTR);
-
-    // Read 32-bit counter value
     digitalWrite(_cs1_pin, LOW);
-    SPI.transfer(OTR);
-    count = SPI.transfer(0x00);
-    count |= ((int32_t)SPI.transfer(0x00) << 8);
-    count |= ((int32_t)SPI.transfer(0x00) << 16);
-    count |= ((int32_t)SPI.transfer(0x00) << 24);
+    SPI.transfer(0x60); // Request count (same as working example)
+    count_1 = SPI.transfer(0x00); // Read highest order byte
+    count_2 = SPI.transfer(0x00);
+    count_3 = SPI.transfer(0x00);
+    count_4 = SPI.transfer(0x00); // Read lowest order byte
     digitalWrite(_cs1_pin, HIGH);
 
-    return count;
+    // Calculate encoder count (highest byte first)
+    count_value = (((int32_t)count_1 << 24) + ((int32_t)count_2 << 16) + ((int32_t)count_3 << 8) + (int32_t)count_4);
+
+    // Reverse direction if needed
+    if (_enc1_reverse) {
+        count_value = -count_value;
+    }
+
+    return count_value;
 }
 
 int32_t LS7166::read_encoder2() {
-    int32_t count = 0;
+    unsigned int count_1, count_2, count_3, count_4;
+    int32_t count_value;
 
-    // Latch counter to output register
-    write_LS7166(_cs2_pin, CMD, LATCH_CNTR);
-
-    // Read 32-bit counter value
     digitalWrite(_cs2_pin, LOW);
-    SPI.transfer(OTR);
-    count = SPI.transfer(0x00);
-    count |= ((int32_t)SPI.transfer(0x00) << 8);
-    count |= ((int32_t)SPI.transfer(0x00) << 16);
-    count |= ((int32_t)SPI.transfer(0x00) << 24);
+    SPI.transfer(0x60); // Request count (same as working example)
+    count_1 = SPI.transfer(0x00); // Read highest order byte
+    count_2 = SPI.transfer(0x00);
+    count_3 = SPI.transfer(0x00);
+    count_4 = SPI.transfer(0x00); // Read lowest order byte
     digitalWrite(_cs2_pin, HIGH);
 
-    return count;
+    // Calculate encoder count (highest byte first)
+    count_value = (((int32_t)count_1 << 24) + ((int32_t)count_2 << 16) + ((int32_t)count_3 << 8) + (int32_t)count_4);
+
+    // Reverse direction if needed
+    if (_enc2_reverse) {
+        count_value = -count_value;
+    }
+
+    return count_value;
 }
 
 void LS7166::reset_encoder1() {
-    write_LS7166(_cs1_pin, CMD, CLR_CNTR);
+    // Set encoder's data register to 0 (same as working example)
+    digitalWrite(_cs1_pin, LOW);
+    SPI.transfer(0x98); // Write to DTR
+    SPI.transfer(0x00); // Highest order byte
+    SPI.transfer(0x00);
+    SPI.transfer(0x00);
+    SPI.transfer(0x00); // Lowest order byte
+    digitalWrite(_cs1_pin, HIGH);
+
+    delayMicroseconds(100);
+
+    // Transfer DTR to CNTR
+    digitalWrite(_cs1_pin, LOW);
+    SPI.transfer(0xE0);
+    digitalWrite(_cs1_pin, HIGH);
 }
 
 void LS7166::reset_encoder2() {
-    write_LS7166(_cs2_pin, CMD, CLR_CNTR);
+    // Set encoder's data register to 0 (same as working example)
+    digitalWrite(_cs2_pin, LOW);
+    SPI.transfer(0x98); // Write to DTR
+    SPI.transfer(0x00); // Highest order byte
+    SPI.transfer(0x00);
+    SPI.transfer(0x00);
+    SPI.transfer(0x00); // Lowest order byte
+    digitalWrite(_cs2_pin, HIGH);
+
+    delayMicroseconds(100);
+
+    // Transfer DTR to CNTR
+    digitalWrite(_cs2_pin, LOW);
+    SPI.transfer(0xE0);
+    digitalWrite(_cs2_pin, HIGH);
 }
 
 void LS7166::reset_encoders() {
