@@ -57,16 +57,34 @@ void motor2_speed_control(int speed)
     }
 }
 
+// LS7166 Encoder
+
+void read_encoder1(void)
+{
+}
+
+void read_encoder2(void)
+{
+}
+
+void reset_encoder1(void)
+{
+}
+
+void reset_encoder2(void)
+{
+}
+
 void servo1_angle_control(int angle)
 {
-    angle = constrain(angle, 0, 180);
-    servo1.write(angle);
+    angle = constrain(angle, -35, 35);
+    servo1.write(SERVO1_NEUTRAL + angle);
 }
 
 void servo2_angle_control(int angle)
 {
-    angle = constrain(angle, 0, 180);
-    servo2.write(angle);
+    angle = constrain(angle, -35, 35);
+    servo2.write(SERVO2_NEUTRAL + angle);
 }
 
 void setup()
