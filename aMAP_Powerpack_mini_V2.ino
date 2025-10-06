@@ -1,40 +1,40 @@
-#include "LS7166.h"
 #include "I2CComm.h"
+#include "LS7166.h"
 #include "PIDController.h"
 #include <Arduino_FreeRTOS.h>
-#include <Servo.h>
-#include <semphr.h>
 #include <SPI.h>
+#include <Servo.h>
 #include <Wire.h>
-#include <avr/wdt.h>  // Watchdog timer library
+#include <avr/wdt.h> // Watchdog timer library
+#include <semphr.h>
 
 // ============================================================================
 // Pin Definitions and Hardware Configuration
 // ============================================================================
 
 // Motor driver pins (H-Bridge control)
-#define MOTOR1_EN1 2            // Motor 1 direction pin 1
-#define MOTOR1_EN2 3            // Motor 1 direction pin 2
-#define MOTOR2_EN1 4            // Motor 2 direction pin 1
-#define MOTOR2_EN2 5            // Motor 2 direction pin 2
+#define MOTOR1_EN1 2 // Motor 1 direction pin 1
+#define MOTOR1_EN2 3 // Motor 1 direction pin 2
+#define MOTOR2_EN1 4 // Motor 2 direction pin 1
+#define MOTOR2_EN2 5 // Motor 2 direction pin 2
 
 // Servo control pins
-#define SERVO1_PIN 6            // Servo 1 PWM control pin
-#define SERVO2_PIN 7            // Servo 2 PWM control pin
-#define SERVO1_NEUTRAL 87       // Servo 1 neutral position (degrees)
-#define SERVO2_NEUTRAL 92       // Servo 2 neutral position (degrees)
-#define SERVO1_ANGLE_LIMIT 35   // Servo 1 angle range: ±35 degrees from neutral
-#define SERVO2_ANGLE_LIMIT 35   // Servo 2 angle range: ±35 degrees from neutral
+#define SERVO1_PIN 6          // Servo 1 PWM control pin
+#define SERVO2_PIN 7          // Servo 2 PWM control pin
+#define SERVO1_NEUTRAL 87     // Servo 1 neutral position (degrees)
+#define SERVO2_NEUTRAL 92     // Servo 2 neutral position (degrees)
+#define SERVO1_ANGLE_LIMIT 35 // Servo 1 angle range: ±35 degrees from neutral
+#define SERVO2_ANGLE_LIMIT 35 // Servo 2 angle range: ±35 degrees from neutral
 
 // Encoder SPI chip select pins
-#define LS7166_CS1 8            // Encoder 1 (Motor 1) CS pin
-#define LS7166_CS2 9            // Encoder 2 (Motor 2) CS pin
+#define LS7166_CS1 8 // Encoder 1 (Motor 1) CS pin
+#define LS7166_CS2 9 // Encoder 2 (Motor 2) CS pin
 
 // Direction reversal settings
-#define ENCODER1_REVERSE true   // true: reverse encoder direction, false: normal
-#define ENCODER2_REVERSE false  // true: reverse encoder direction, false: normal
-#define MOTOR1_REVERSE false    // true: reverse motor direction, false: normal
-#define MOTOR2_REVERSE false    // true: reverse motor direction, false: normal
+#define ENCODER1_REVERSE true  // true: reverse encoder direction, false: normal
+#define ENCODER2_REVERSE false // true: reverse encoder direction, false: normal
+#define MOTOR1_REVERSE false   // true: reverse motor direction, false: normal
+#define MOTOR2_REVERSE true    // true: reverse motor direction, false: normal
 
 // Encoder calibration (adjust these values for your robot)
 // 1m 당 pulse 수 - 확인 해야 함
@@ -58,37 +58,38 @@
 // ============================================================================
 
 // Motor Speed Control PID (Delta-based, 50Hz)
-#define MOTOR1_SPEED_KP 26.0    // Proportional gain
-#define MOTOR1_SPEED_KI 0.0     // Integral gain
-#define MOTOR1_SPEED_KD 50.0    // Derivative gain
+#define MOTOR1_SPEED_KP 26.0 // Proportional gain
+#define MOTOR1_SPEED_KI 0.0  // Integral gain
+#define MOTOR1_SPEED_KD 50.0 // Derivative gain
 
-#define MOTOR2_SPEED_KP 26.0    // Proportional gain
-#define MOTOR2_SPEED_KI 0.0     // Integral gain
-#define MOTOR2_SPEED_KD 50.0    // Derivative gain
+#define MOTOR2_SPEED_KP 26.0 // Proportional gain
+#define MOTOR2_SPEED_KI 0.0  // Integral gain
+#define MOTOR2_SPEED_KD 50.0 // Derivative gain
 
 // Motor Position Control PID
-#define MOTOR1_POS_KP 2.0       // Proportional gain
-#define MOTOR1_POS_KI 0.1       // Integral gain
-#define MOTOR1_POS_KD 10.0      // Derivative gain
+#define MOTOR1_POS_KP 0.1  // Proportional gain
+#define MOTOR1_POS_KI 0.03 // Integral gain
+#define MOTOR1_POS_KD 0.7  // Derivative gain
 
-#define MOTOR2_POS_KP 2.0       // Proportional gain
-#define MOTOR2_POS_KI 0.1       // Integral gain
-#define MOTOR2_POS_KD 10.0      // Derivative gain
+#define MOTOR2_POS_KP 0.1  // Proportional gain
+#define MOTOR2_POS_KI 0.03 // Integral gain
+#define MOTOR2_POS_KD 0.7  // Derivative gain
 
 // ============================================================================
 // Watchdog Configuration
 // ============================================================================
-#define WATCHDOG_ENABLE true    // Enable/disable watchdog timer
-#define WATCHDOG_TIMEOUT WDTO_2S // Watchdog timeout: 2 seconds
-                                 // Options: WDTO_15MS, WDTO_30MS, WDTO_60MS, WDTO_120MS,
-                                 //          WDTO_250MS, WDTO_500MS, WDTO_1S, WDTO_2S, WDTO_4S, WDTO_8S
+#define WATCHDOG_ENABLE true // Enable/disable watchdog timer
+#define WATCHDOG_TIMEOUT                                                                                               \
+    WDTO_2S // Watchdog timeout: 2 seconds
+            // Options: WDTO_15MS, WDTO_30MS, WDTO_60MS, WDTO_120MS,
+            //          WDTO_250MS, WDTO_500MS, WDTO_1S, WDTO_2S, WDTO_4S, WDTO_8S
 
 // Control modes
 enum ControlMode
 {
-    MODE_PWM = 0,           // Direct PWM control (NO FEEDBACK)
-    MODE_SPEED_CONTROL,     // Speed control with PID
-    MODE_POSITION_CONTROL   // Position control with PID
+    MODE_PWM = 0,         // Direct PWM control (NO FEEDBACK)
+    MODE_SPEED_CONTROL,   // Speed control with PID
+    MODE_POSITION_CONTROL // Position control with PID
 };
 
 // Motor control structure
@@ -98,6 +99,7 @@ typedef struct
     int current_speed;
     int32_t target_position;
     int32_t current_position;
+    int pwm_output;
     ControlMode mode;
 } MotorControl;
 
@@ -108,8 +110,8 @@ LS7166 encoder(LS7166_CS1, LS7166_CS2, ENCODER1_REVERSE, ENCODER2_REVERSE);
 I2CComm i2c;
 
 // Control structures
-MotorControl motor1_ctrl = {0, 0, 0, 0, MODE_PWM};
-MotorControl motor2_ctrl = {0, 0, 0, 0, MODE_PWM};
+MotorControl motor1_ctrl = {0, 0, 0, 0, 0, MODE_PWM};
+MotorControl motor2_ctrl = {0, 0, 0, 0, 0, MODE_PWM};
 
 // Semaphores for data protection
 SemaphoreHandle_t xMotor1Semaphore;
@@ -131,7 +133,8 @@ void motor2_speed_control(int speed);
 
 // Helper functions
 void setMotorControl(MotorControl *motor_ctrl, SemaphoreHandle_t semaphore, PIDController &speedPID,
-                     PIDController &posPID, void (*speed_control_func)(int), uint8_t mode, int16_t data_s, int32_t data_l);
+                     PIDController &posPID, void (*speed_control_func)(int), uint8_t mode, int16_t data_s,
+                     int32_t data_l);
 void initializeI2C();
 
 // I2C callback functions
@@ -262,15 +265,17 @@ void TaskMotorControl(void *pvParameters)
                 int32_t target_delta2 = (int32_t)(motor2_ctrl.target_speed * vel_2_pulse);
                 int32_t delta_error2 = target_delta2 - actual_delta2;
 
-                motor2SpeedPID.setOutputLimits(-255, 255);
+                motor2SpeedPID.setOutputLimits(-120, 120);
                 int output = (int)motor2SpeedPID.compute((float)delta_error2);
+                motor2_ctrl.pwm_output = output;
                 motor2_speed_control(output);
             }
             else if (motor2_ctrl.mode == MODE_POSITION_CONTROL)
             {
                 // Position control: Position-based PID
-                motor2PositionPID.setOutputLimits(-255, 255);
+                motor2PositionPID.setOutputLimits(-120, 120);
                 int output = (int)motor2PositionPID.compute(motor2_ctrl.target_position, motor2_ctrl.current_position);
+                motor2_ctrl.pwm_output = output;
                 motor2_speed_control(output);
             }
             else if (motor2_ctrl.mode == MODE_PWM)
@@ -286,21 +291,21 @@ void TaskMotorControl(void *pvParameters)
         last_enc1 = current_enc1;
         last_enc2 = current_enc2;
 
-        // Reset watchdog timer
-        #if WATCHDOG_ENABLE
+// Reset watchdog timer
+#if WATCHDOG_ENABLE
         wdt_reset();
-        #endif
+#endif
 
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
-// Task 3: Serial Communication (debug output every 1 second)
+// Task 3: Serial Communication (debug output every 50ms)
 void TaskSerialCommunication(void *pvParameters)
 {
     (void)pvParameters;
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(1000); // 1Hz (1 second)
+    const TickType_t xFrequency = pdMS_TO_TICKS(50); // 20Hz (50ms)
 
     for (;;)
     {
@@ -322,6 +327,9 @@ void TaskSerialCommunication(void *pvParameters)
         {
             i2c.setMotor2Status(motor2_ctrl.current_position, motor2_ctrl.current_speed, motor2_ctrl.mode);
             status += "Pos=" + String(motor2_ctrl.current_position);
+            status += " Target=" + String(motor2_ctrl.target_position);
+            status += " Error=" + String(motor2_ctrl.target_position - motor2_ctrl.current_position);
+            status += " PWM=" + String(motor2_ctrl.pwm_output);
             status += " Speed=" + String(motor2_ctrl.current_speed);
             status += " Mode=" + String(motor2_ctrl.mode);
             xSemaphoreGive(xMotor2Semaphore);
@@ -344,10 +352,10 @@ void TaskSerialCommunication(void *pvParameters)
 
 void setup()
 {
-    // Disable watchdog during setup
-    #if WATCHDOG_ENABLE
+// Disable watchdog during setup
+#if WATCHDOG_ENABLE
     wdt_disable();
-    #endif
+#endif
 
     Serial.begin(115200);
     while (!Serial)
@@ -377,26 +385,35 @@ void setup()
     Serial.println("\n=== SPI Communication Test ===");
 
     // Test CS pins
-    Serial.print("CS1 Pin ("); Serial.print(LS7166_CS1); Serial.println(") - Testing...");
+    Serial.print("CS1 Pin (");
+    Serial.print(LS7166_CS1);
+    Serial.println(") - Testing...");
     pinMode(LS7166_CS1, OUTPUT);
     digitalWrite(LS7166_CS1, HIGH);
-    Serial.print("  CS1 HIGH: "); Serial.println(digitalRead(LS7166_CS1));
+    Serial.print("  CS1 HIGH: ");
+    Serial.println(digitalRead(LS7166_CS1));
     digitalWrite(LS7166_CS1, LOW);
-    Serial.print("  CS1 LOW: "); Serial.println(digitalRead(LS7166_CS1));
+    Serial.print("  CS1 LOW: ");
+    Serial.println(digitalRead(LS7166_CS1));
     digitalWrite(LS7166_CS1, HIGH);
 
-    Serial.print("CS2 Pin ("); Serial.print(LS7166_CS2); Serial.println(") - Testing...");
+    Serial.print("CS2 Pin (");
+    Serial.print(LS7166_CS2);
+    Serial.println(") - Testing...");
     pinMode(LS7166_CS2, OUTPUT);
     digitalWrite(LS7166_CS2, HIGH);
-    Serial.print("  CS2 HIGH: "); Serial.println(digitalRead(LS7166_CS2));
+    Serial.print("  CS2 HIGH: ");
+    Serial.println(digitalRead(LS7166_CS2));
     digitalWrite(LS7166_CS2, LOW);
-    Serial.print("  CS2 LOW: "); Serial.println(digitalRead(LS7166_CS2));
+    Serial.print("  CS2 LOW: ");
+    Serial.println(digitalRead(LS7166_CS2));
     digitalWrite(LS7166_CS2, HIGH);
 
     // Test SPI pins (Arduino Mega 2560)
     Serial.println("\nSPI Pins (Mega 2560):");
     Serial.println("  MOSI (51), MISO (50), SCK (52)");
-    Serial.print("  MISO state: "); Serial.println(digitalRead(50));
+    Serial.print("  MISO state: ");
+    Serial.println(digitalRead(50));
 
     // Raw SPI test
     Serial.println("\nRaw SPI Communication Test:");
@@ -420,7 +437,8 @@ void setup()
     Serial.print("Encoder 2 initial value: ");
     Serial.println(test2);
 
-    if (test1 == -1 && test2 == -1) {
+    if (test1 == -1 && test2 == -1)
+    {
         Serial.println("\n!!! WARNING: Both encoders return -1 (0xFFFFFFFF)");
         Serial.println("!!! This indicates SPI communication failure");
         Serial.println("!!! Check (Arduino Mega 2560):");
@@ -432,6 +450,26 @@ void setup()
         Serial.println("!!!   6. LS7166 power (VCC/GND)");
     }
     Serial.println("==============================\n");
+
+    // Test motor direction with PWM mode
+
+    // motor1_ctrl.mode = MODE_PWM;
+    // motor1_ctrl.target_speed = 30;
+
+    // motor2_ctrl.mode = MODE_PWM;
+    // motor2_ctrl.target_speed = 30;
+
+    // Test motor with position control
+
+    motor1_ctrl.mode = MODE_POSITION_CONTROL;
+    motor1_ctrl.target_position = 1000; // 목표 위치: 1000 펄스
+
+    motor2_ctrl.mode = MODE_POSITION_CONTROL;
+    motor2_ctrl.target_position = 1000; // 목표 위치: 1000 펄스
+
+    // Set integral limits for position control to prevent windup
+    motor1PositionPID.setIntegralLimit(1000.0);
+    motor2PositionPID.setIntegralLimit(1000.0);
 
     // Create semaphores
     xMotor1Semaphore = xSemaphoreCreateMutex();
@@ -465,13 +503,13 @@ void setup()
     Serial.println("  RESET - Reset encoders");
     Serial.println("  STATUS - Get current status");
 
-    // Enable watchdog timer (must be last in setup)
-    #if WATCHDOG_ENABLE
+// Enable watchdog timer (must be last in setup)
+#if WATCHDOG_ENABLE
     wdt_enable(WATCHDOG_TIMEOUT);
     Serial.print("Watchdog enabled with ");
     Serial.print(WATCHDOG_TIMEOUT == WDTO_2S ? "2" : "?");
     Serial.println(" second timeout");
-    #endif
+#endif
 }
 
 void loop()
@@ -484,7 +522,8 @@ void loop()
 // ============================================================================
 
 void setMotorControl(MotorControl *motor_ctrl, SemaphoreHandle_t semaphore, PIDController &speedPID,
-                     PIDController &posPID, void (*speed_control_func)(int), uint8_t mode, int16_t data_s, int32_t data_l)
+                     PIDController &posPID, void (*speed_control_func)(int), uint8_t mode, int16_t data_s,
+                     int32_t data_l)
 {
     if (xSemaphoreTake(semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
     {
@@ -534,18 +573,22 @@ void initializeI2C()
 
 void onDualMotorCommand(uint8_t mode, int16_t m1_data_s, int32_t m1_data_l, int16_t m2_data_s, int32_t m2_data_l)
 {
-    setMotorControl(&motor1_ctrl, xMotor1Semaphore, motor1SpeedPID, motor1PositionPID, motor1_speed_control, mode, m1_data_s, m1_data_l);
-    setMotorControl(&motor2_ctrl, xMotor2Semaphore, motor2SpeedPID, motor2PositionPID, motor2_speed_control, mode, m2_data_s, m2_data_l);
+    setMotorControl(&motor1_ctrl, xMotor1Semaphore, motor1SpeedPID, motor1PositionPID, motor1_speed_control, mode,
+                    m1_data_s, m1_data_l);
+    setMotorControl(&motor2_ctrl, xMotor2Semaphore, motor2SpeedPID, motor2PositionPID, motor2_speed_control, mode,
+                    m2_data_s, m2_data_l);
 }
 
 void onMotor1Command(uint8_t mode, int16_t data_s, int32_t data_l)
 {
-    setMotorControl(&motor1_ctrl, xMotor1Semaphore, motor1SpeedPID, motor1PositionPID, motor1_speed_control, mode, data_s, data_l);
+    setMotorControl(&motor1_ctrl, xMotor1Semaphore, motor1SpeedPID, motor1PositionPID, motor1_speed_control, mode,
+                    data_s, data_l);
 }
 
 void onMotor2Command(uint8_t mode, int16_t data_s, int32_t data_l)
 {
-    setMotorControl(&motor2_ctrl, xMotor2Semaphore, motor2SpeedPID, motor2PositionPID, motor2_speed_control, mode, data_s, data_l);
+    setMotorControl(&motor2_ctrl, xMotor2Semaphore, motor2SpeedPID, motor2PositionPID, motor2_speed_control, mode,
+                    data_s, data_l);
 }
 
 void onDualServoCommand(int8_t servo1_angle, int8_t servo2_angle)
