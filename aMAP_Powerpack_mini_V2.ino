@@ -58,13 +58,13 @@
 // ============================================================================
 
 // Motor Speed Control PID (Delta-based, 50Hz)
-#define MOTOR1_SPEED_KP 26.0 // Proportional gain
-#define MOTOR1_SPEED_KI 0.0  // Integral gain
-#define MOTOR1_SPEED_KD 50.0 // Derivative gain
+#define MOTOR1_SPEED_KP 4.5 // Proportional gain
+#define MOTOR1_SPEED_KI 0.0 // Integral gain
+#define MOTOR1_SPEED_KD 7.0 // Derivative gain
 
-#define MOTOR2_SPEED_KP 26.0 // Proportional gain
-#define MOTOR2_SPEED_KI 0.0  // Integral gain
-#define MOTOR2_SPEED_KD 50.0 // Derivative gain
+#define MOTOR2_SPEED_KP 4.5 // Proportional gain
+#define MOTOR2_SPEED_KI 0.0 // Integral gain
+#define MOTOR2_SPEED_KD 7.0 // Derivative gain
 
 // Motor Position Control PID
 #define MOTOR1_POS_KP 0.1  // Proportional gain
@@ -233,7 +233,7 @@ void TaskMotorControl(void *pvParameters)
                 int32_t target_delta1 = (int32_t)(motor1_ctrl.target_speed * vel_1_pulse);
                 int32_t delta_error1 = target_delta1 - actual_delta1;
 
-                motor1SpeedPID.setOutputLimits(-255, 255);
+                motor1SpeedPID.setOutputLimits(-150, 150);
                 int output = (int)motor1SpeedPID.compute((float)delta_error1);
                 motor1_speed_control(output);
             }
@@ -461,11 +461,14 @@ void setup()
 
     // Test motor with position control
 
-    motor1_ctrl.mode = MODE_POSITION_CONTROL;
-    motor1_ctrl.target_position = 1000; // 목표 위치: 1000 펄스
+    motor1_ctrl.mode = MODE_SPEED_CONTROL;
+    motor1_ctrl.target_speed = 3.5; // 목표 속도: 50
 
-    motor2_ctrl.mode = MODE_POSITION_CONTROL;
-    motor2_ctrl.target_position = 1000; // 목표 위치: 1000 펄스
+    motor2_ctrl.mode = MODE_SPEED_CONTROL;
+    motor2_ctrl.target_speed = 3.5; // 목표 속도: 50
+
+    // motor2_ctrl.mode = MODE_POSITION_CONTROL;
+    // motor2_ctrl.target_position = 1000; // 목표 위치: 1000 펄스
 
     // Set integral limits for position control to prevent windup
     motor1PositionPID.setIntegralLimit(1000.0);
