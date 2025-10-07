@@ -37,13 +37,13 @@
 #define MOTOR2_REVERSE true    // true: reverse motor direction, false: normal
 
 // Encoder calibration (adjust these values for your robot)
-// 1m 당 pulse 수 - 확인 해야 함
-#define m_1_pulse 344
-#define m_2_pulse 344
+// 1m 당 pulse 수 - 실험 데이터 기반 (20cm 이동 ≈ 2300 펄스)
+#define m_1_pulse 11500
+#define m_2_pulse 11650
 
-// pulse 당 m - 확인 해야 함
-#define pulse_1_m 1. / 344.
-#define pulse_2_m 1. / 344.
+// pulse 당 m - 실험 데이터 기반
+#define pulse_1_m 1. / 11500.
+#define pulse_2_m 1. / 11650.
 
 // Speed control frequency: 50Hz (20ms period)
 #define SPEED_CONTROL_FREQ_HZ 50
@@ -461,11 +461,11 @@ void setup()
 
     // Test motor with position control
 
-    motor1_ctrl.mode = MODE_SPEED_CONTROL;
-    motor1_ctrl.target_speed = 3.5; // 목표 속도: 50
+    // motor1_ctrl.mode = MODE_SPEED_CONTROL;
+    // motor1_ctrl.target_speed = 3.5; // 목표 속도: 50
 
-    motor2_ctrl.mode = MODE_SPEED_CONTROL;
-    motor2_ctrl.target_speed = 3.5; // 목표 속도: 50
+    // motor2_ctrl.mode = MODE_SPEED_CONTROL;
+    // motor2_ctrl.target_speed = 3.5; // 목표 속도: 50
 
     // motor2_ctrl.mode = MODE_POSITION_CONTROL;
     // motor2_ctrl.target_position = 1000; // 목표 위치: 1000 펄스
