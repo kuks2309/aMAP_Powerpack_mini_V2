@@ -97,8 +97,9 @@ typedef struct
 {
     int target_speed;
     int current_speed;
-    int32_t target_position;
-    int32_t current_position;
+    int32_t target_position;      // in pulse
+    int32_t current_position;     // in pulse
+    int32_t target_position_mm;   // in mm (for external interface)
     int pwm_output;
     ControlMode mode;
 } MotorControl;
@@ -110,8 +111,8 @@ LS7166 encoder(LS7166_CS1, LS7166_CS2, ENCODER1_REVERSE, ENCODER2_REVERSE);
 I2CComm i2c;
 
 // Control structures
-MotorControl motor1_ctrl = {0, 0, 0, 0, 0, MODE_PWM};
-MotorControl motor2_ctrl = {0, 0, 0, 0, 0, MODE_PWM};
+MotorControl motor1_ctrl = {0, 0, 0, 0, 0, 0, MODE_PWM};
+MotorControl motor2_ctrl = {0, 0, 0, 0, 0, 0, MODE_PWM};
 
 // Semaphores for data protection
 SemaphoreHandle_t xMotor1Semaphore;
@@ -134,7 +135,7 @@ void motor2_speed_control(int speed);
 // Helper functions
 void setMotorControl(MotorControl *motor_ctrl, SemaphoreHandle_t semaphore, PIDController &speedPID,
                      PIDController &posPID, void (*speed_control_func)(int), uint8_t mode, int16_t data_s,
-                     int32_t data_l);
+                     int32_t data_l, float pulse_per_m);
 void initializeI2C();
 
 // I2C callback functions
@@ -497,14 +498,12 @@ void setup()
 
     Serial.println("RTOS Motor Control System Started");
     Serial.println("Commands:");
-    Serial.println("  M1S[speed] - Motor1 speed control (-255 to 255)");
-    Serial.println("  M2S[speed] - Motor2 speed control (-255 to 255)");
-    Serial.println("  M1P[position] - Motor1 position control");
-    Serial.println("  M2P[position] - Motor2 position control");
-    Serial.println("  M1I - Motor1 idle");
-    Serial.println("  M2I - Motor2 idle");
-    Serial.println("  RESET - Reset encoders");
-    Serial.println("  STATUS - Get current status");
+    Serial.println("  I2C Motor Control:");
+    Serial.println("    - PWM mode: direct PWM (-255 to 255)");
+    Serial.println("    - Speed mode: target speed (m/s)");
+    Serial.println("    - Position mode: target position (mm)");
+    Serial.println("  I2C Servo Control:");
+    Serial.println("    - Servo angles (degrees, relative to neutral)");
 
 // Enable watchdog timer (must be last in setup)
 #if WATCHDOG_ENABLE
@@ -526,7 +525,7 @@ void loop()
 
 void setMotorControl(MotorControl *motor_ctrl, SemaphoreHandle_t semaphore, PIDController &speedPID,
                      PIDController &posPID, void (*speed_control_func)(int), uint8_t mode, int16_t data_s,
-                     int32_t data_l)
+                     int32_t data_l, float pulse_per_m)
 {
     if (xSemaphoreTake(semaphore, pdMS_TO_TICKS(10)) == pdTRUE)
     {
@@ -545,7 +544,9 @@ void setMotorControl(MotorControl *motor_ctrl, SemaphoreHandle_t semaphore, PIDC
         else if (mode == I2C_MODE_POSITION)
         {
             motor_ctrl->mode = MODE_POSITION_CONTROL;
-            motor_ctrl->target_position = data_l;
+            motor_ctrl->target_position_mm = data_l;  // Store mm value
+            // Convert mm to pulse: pulse = (mm / 1000) * pulse_per_m
+            motor_ctrl->target_position = (int32_t)((float)data_l * pulse_per_m / 1000.0);
             posPID.reset();
         }
         xSemaphoreGive(semaphore);
@@ -577,21 +578,21 @@ void initializeI2C()
 void onDualMotorCommand(uint8_t mode, int16_t m1_data_s, int32_t m1_data_l, int16_t m2_data_s, int32_t m2_data_l)
 {
     setMotorControl(&motor1_ctrl, xMotor1Semaphore, motor1SpeedPID, motor1PositionPID, motor1_speed_control, mode,
-                    m1_data_s, m1_data_l);
+                    m1_data_s, m1_data_l, m_1_pulse);
     setMotorControl(&motor2_ctrl, xMotor2Semaphore, motor2SpeedPID, motor2PositionPID, motor2_speed_control, mode,
-                    m2_data_s, m2_data_l);
+                    m2_data_s, m2_data_l, m_2_pulse);
 }
 
 void onMotor1Command(uint8_t mode, int16_t data_s, int32_t data_l)
 {
     setMotorControl(&motor1_ctrl, xMotor1Semaphore, motor1SpeedPID, motor1PositionPID, motor1_speed_control, mode,
-                    data_s, data_l);
+                    data_s, data_l, m_1_pulse);
 }
 
 void onMotor2Command(uint8_t mode, int16_t data_s, int32_t data_l)
 {
     setMotorControl(&motor2_ctrl, xMotor2Semaphore, motor2SpeedPID, motor2PositionPID, motor2_speed_control, mode,
-                    data_s, data_l);
+                    data_s, data_l, m_2_pulse);
 }
 
 void onDualServoCommand(int8_t servo1_angle, int8_t servo2_angle)
