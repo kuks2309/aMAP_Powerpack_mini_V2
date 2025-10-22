@@ -1,12 +1,13 @@
-#include "I2CComm.h"
-#include "LS7166.h"
-#include "PIDController.h"
 #include <Arduino_FreeRTOS.h>
 #include <SPI.h>
 #include <Servo.h>
 #include <Wire.h>
 #include <avr/wdt.h> // Watchdog timer library
 #include <semphr.h>
+#include "I2CComm.h"
+#include "LS7166.h"
+#include "PIDController.h"
+#include "remote_control.h"
 
 // ============================================================================
 // Pin Definitions and Hardware Configuration
@@ -48,10 +49,6 @@
 // Speed control frequency: 50Hz (20ms period)
 #define SPEED_CONTROL_FREQ_HZ 50
 #define SPEED_CONTROL_PERIOD_MS (1000 / SPEED_CONTROL_FREQ_HZ)
-
-// 50Hz 제어 주기에서 속도와 Δpulse 변환 값
-#define vel_1_pulse m_1_pulse / 20.
-#define vel_2_pulse m_2_pulse / 20.
 
 // ============================================================================
 // PID Controller Gains
@@ -95,8 +92,9 @@ enum ControlMode
 // Motor control structure
 typedef struct
 {
-    int target_speed;
-    int current_speed;
+    int target_speed;             // internal: raw value or delta pulse
+    int current_speed;            // in delta pulse per control cycle
+    int16_t target_speed_mms;     // in mm/s (for external interface)
     int32_t target_position;      // in pulse
     int32_t current_position;     // in pulse
     int32_t target_position_mm;   // in mm (for external interface)
@@ -110,9 +108,12 @@ Servo servo2;
 LS7166 encoder(LS7166_CS1, LS7166_CS2, ENCODER1_REVERSE, ENCODER2_REVERSE);
 I2CComm i2c;
 
+// Remote Control object (using Serial2) - will be initialized in setup()
+RemoteControl* remote_control;
+
 // Control structures
-MotorControl motor1_ctrl = {0, 0, 0, 0, 0, 0, MODE_PWM};
-MotorControl motor2_ctrl = {0, 0, 0, 0, 0, 0, MODE_PWM};
+MotorControl motor1_ctrl = {0, 0, 0, 0, 0, 0, 0, MODE_PWM};
+MotorControl motor2_ctrl = {0, 0, 0, 0, 0, 0, 0, MODE_PWM};
 
 // Semaphores for data protection
 SemaphoreHandle_t xMotor1Semaphore;
@@ -231,8 +232,8 @@ void TaskMotorControl(void *pvParameters)
             if (motor1_ctrl.mode == MODE_SPEED_CONTROL)
             {
                 // Speed control: Delta-based PID
-                int32_t target_delta1 = (int32_t)(motor1_ctrl.target_speed * vel_1_pulse);
-                int32_t delta_error1 = target_delta1 - actual_delta1;
+                // target_speed already converted from mm/s to delta pulse per cycle
+                int32_t delta_error1 = motor1_ctrl.target_speed - actual_delta1;
 
                 motor1SpeedPID.setOutputLimits(-150, 150);
                 int output = (int)motor1SpeedPID.compute((float)delta_error1);
@@ -263,8 +264,8 @@ void TaskMotorControl(void *pvParameters)
             if (motor2_ctrl.mode == MODE_SPEED_CONTROL)
             {
                 // Speed control: Delta-based PID
-                int32_t target_delta2 = (int32_t)(motor2_ctrl.target_speed * vel_2_pulse);
-                int32_t delta_error2 = target_delta2 - actual_delta2;
+                // target_speed already converted from mm/s to delta pulse per cycle
+                int32_t delta_error2 = motor2_ctrl.target_speed - actual_delta2;
 
                 motor2SpeedPID.setOutputLimits(-120, 120);
                 int output = (int)motor2SpeedPID.compute((float)delta_error2);
@@ -310,6 +311,149 @@ void TaskSerialCommunication(void *pvParameters)
 
     for (;;)
     {
+        // Update remote control data
+        if (remote_control)
+        {
+            remote_control->update();
+
+            // Control based on mode
+            if (remote_control->isConnected())
+            {
+                uint8_t drive_mode = remote_control->getDriveMode();
+
+                // SBUS range constants
+                const int16_t SBUS_CENTER = 1011;
+                const int16_t DEAD_ZONE = 20;
+                const int16_t SBUS_MIN = 200;
+                const int16_t SBUS_MAX = 1800;
+
+                // ===== MANUAL MODE: Control both steering and motors =====
+                if (drive_mode == RC_MODE_MANUAL)
+                {
+                    // ----- CH0: Steering Control -----
+                    int16_t ch0_value = remote_control->getChannel(0);
+                    int16_t ch0_adjusted = ch0_value;
+
+                    // Apply dead zone to CH0
+                    if (ch0_value >= (SBUS_CENTER - DEAD_ZONE) && ch0_value <= (SBUS_CENTER + DEAD_ZONE))
+                    {
+                        ch0_adjusted = SBUS_CENTER;
+                    }
+
+                    // Map SBUS value to servo angle
+                    int servo1_angle = map(ch0_adjusted, SBUS_MIN, SBUS_MAX,
+                                          SERVO1_NEUTRAL - SERVO1_ANGLE_LIMIT,
+                                          SERVO1_NEUTRAL + SERVO1_ANGLE_LIMIT);
+                    servo1_angle = constrain(servo1_angle,
+                                            SERVO1_NEUTRAL - SERVO1_ANGLE_LIMIT,
+                                            SERVO1_NEUTRAL + SERVO1_ANGLE_LIMIT);
+
+                    int servo2_angle = map(ch0_adjusted, SBUS_MIN, SBUS_MAX,
+                                          SERVO2_NEUTRAL - SERVO2_ANGLE_LIMIT,
+                                          SERVO2_NEUTRAL + SERVO2_ANGLE_LIMIT);
+                    servo2_angle = constrain(servo2_angle,
+                                            SERVO2_NEUTRAL - SERVO2_ANGLE_LIMIT,
+                                            SERVO2_NEUTRAL + SERVO2_ANGLE_LIMIT);
+
+                    // Apply to servos
+                    servo1.write(servo1_angle);
+                    servo2.write(servo2_angle);
+
+                    // ----- CH1: Motor Throttle Control -----
+                    int16_t ch1_value = remote_control->getChannel(1);
+                    int16_t ch1_adjusted = ch1_value;
+
+                    // Apply dead zone to CH1
+                    if (ch1_value >= (SBUS_CENTER - DEAD_ZONE) && ch1_value <= (SBUS_CENTER + DEAD_ZONE))
+                    {
+                        ch1_adjusted = SBUS_CENTER;
+                    }
+
+                    // Map SBUS value to PWM
+                    // SBUS: 200 -> Forward max -> PWM: 255
+                    // SBUS: 1011 -> Stop -> PWM: 0
+                    // SBUS: 1800 -> Reverse max -> PWM: -255
+                    int motor_pwm = 0;
+                    if (ch1_adjusted < SBUS_CENTER)
+                    {
+                        // Forward: 200-1011 -> 255-0
+                        motor_pwm = map(ch1_adjusted, SBUS_MIN, SBUS_CENTER, 255, 0);
+                    }
+                    else if (ch1_adjusted > SBUS_CENTER)
+                    {
+                        // Reverse: 1011-1800 -> 0-(-255)
+                        motor_pwm = map(ch1_adjusted, SBUS_CENTER, SBUS_MAX, 0, -255);
+                    }
+
+                    motor_pwm = constrain(motor_pwm, -255, 255);
+
+                    // Apply to motors
+                    if (xSemaphoreTake(xMotor1Semaphore, pdMS_TO_TICKS(5)) == pdTRUE)
+                    {
+                        motor1_ctrl.mode = MODE_PWM;
+                        motor1_ctrl.target_speed = motor_pwm;
+                        xSemaphoreGive(xMotor1Semaphore);
+                    }
+
+                    if (xSemaphoreTake(xMotor2Semaphore, pdMS_TO_TICKS(5)) == pdTRUE)
+                    {
+                        motor2_ctrl.mode = MODE_PWM;
+                        motor2_ctrl.target_speed = motor_pwm;
+                        xSemaphoreGive(xMotor2Semaphore);
+                    }
+                }
+                // ===== SEMI_AUTO MODE: Steering by I2C, Motors by CH1 =====
+                else if (drive_mode == RC_MODE_SEMI_AUTO)
+                {
+                    // Steering is controlled by I2C topic (no RC control)
+                    // Servos will be controlled by I2C callbacks (onServo1Command, onServo2Command)
+
+                    // ----- CH1: Motor Throttle Control -----
+                    int16_t ch1_value = remote_control->getChannel(1);
+                    int16_t ch1_adjusted = ch1_value;
+
+                    // Apply dead zone to CH1
+                    if (ch1_value >= (SBUS_CENTER - DEAD_ZONE) && ch1_value <= (SBUS_CENTER + DEAD_ZONE))
+                    {
+                        ch1_adjusted = SBUS_CENTER;
+                    }
+
+                    // Map SBUS value to PWM
+                    int motor_pwm = 0;
+                    if (ch1_adjusted < SBUS_CENTER)
+                    {
+                        // Forward: 200-1011 -> 255-0
+                        motor_pwm = map(ch1_adjusted, SBUS_MIN, SBUS_CENTER, 255, 0);
+                    }
+                    else if (ch1_adjusted > SBUS_CENTER)
+                    {
+                        // Reverse: 1011-1800 -> 0-(-255)
+                        motor_pwm = map(ch1_adjusted, SBUS_CENTER, SBUS_MAX, 0, -255);
+                    }
+
+                    motor_pwm = constrain(motor_pwm, -255, 255);
+
+                    // Apply to motors
+                    if (xSemaphoreTake(xMotor1Semaphore, pdMS_TO_TICKS(5)) == pdTRUE)
+                    {
+                        motor1_ctrl.mode = MODE_PWM;
+                        motor1_ctrl.target_speed = motor_pwm;
+                        xSemaphoreGive(xMotor1Semaphore);
+                    }
+
+                    if (xSemaphoreTake(xMotor2Semaphore, pdMS_TO_TICKS(5)) == pdTRUE)
+                    {
+                        motor2_ctrl.mode = MODE_PWM;
+                        motor2_ctrl.target_speed = motor_pwm;
+                        xSemaphoreGive(xMotor2Semaphore);
+                    }
+                }
+                // ===== FULL_AUTO MODE: Both controlled by I2C =====
+                // In FULL_AUTO mode, both steering and motors are controlled by I2C
+                // No RC control needed
+            }
+        }
+
         // Update I2C status and build debug string
         String status = "M1: ";
 
@@ -340,6 +484,33 @@ void TaskSerialCommunication(void *pvParameters)
         status += " | S1=" + String(servo1.read());
         status += " S2=" + String(servo2.read());
 
+        // Add Remote Control status
+        if (remote_control)
+        {
+            status += " | RC: ";
+            if (remote_control->isConnected())
+            {
+                status += "CONNECTED";
+                status += " Mode=" + String(remote_control->getDriveModeString());
+                status += " CH0=" + String(remote_control->getChannel(0));
+                status += " CH1=" + String(remote_control->getChannel(1));
+
+                RemoteControlData rc_data = remote_control->getData();
+                if (rc_data.lost_frame)
+                {
+                    status += " [LOST_FRAME]";
+                }
+                if (rc_data.failsafe)
+                {
+                    status += " [FAILSAFE]";
+                }
+            }
+            else
+            {
+                status += "DISCONNECTED";
+            }
+        }
+
         // Debug output
         if (xSemaphoreTake(xSerialSemaphore, pdMS_TO_TICKS(10)) == pdTRUE)
         {
@@ -358,11 +529,18 @@ void setup()
     wdt_disable();
 #endif
 
+    // Initialize Serial ports
     Serial.begin(115200);
     while (!Serial)
     {
         ;
     }
+
+    // Initialize Remote Control (SBUS on Serial2)
+    // Note: Serial2 is available on Arduino Mega 2560 (pins 16=RX2, 17=TX2)
+    remote_control = new RemoteControl(&Serial2);
+    remote_control->begin();
+    Serial.println("Remote Control (SBUS) initialized on Serial2");
 
     // Initialize hardware
     pinMode(MOTOR1_EN1, OUTPUT);
@@ -452,25 +630,6 @@ void setup()
     }
     Serial.println("==============================\n");
 
-    // Test motor direction with PWM mode
-
-    // motor1_ctrl.mode = MODE_PWM;
-    // motor1_ctrl.target_speed = 30;
-
-    // motor2_ctrl.mode = MODE_PWM;
-    // motor2_ctrl.target_speed = 30;
-
-    // Test motor with position control
-
-    // motor1_ctrl.mode = MODE_SPEED_CONTROL;
-    // motor1_ctrl.target_speed = 3.5; // 목표 속도: 50
-
-    // motor2_ctrl.mode = MODE_SPEED_CONTROL;
-    // motor2_ctrl.target_speed = 3.5; // 목표 속도: 50
-
-    // motor2_ctrl.mode = MODE_POSITION_CONTROL;
-    // motor2_ctrl.target_position = 1000; // 목표 위치: 1000 펄스
-
     // Set integral limits for position control to prevent windup
     motor1PositionPID.setIntegralLimit(1000.0);
     motor2PositionPID.setIntegralLimit(1000.0);
@@ -500,7 +659,7 @@ void setup()
     Serial.println("Commands:");
     Serial.println("  I2C Motor Control:");
     Serial.println("    - PWM mode: direct PWM (-255 to 255)");
-    Serial.println("    - Speed mode: target speed (m/s)");
+    Serial.println("    - Speed mode: target speed (mm/s)");
     Serial.println("    - Position mode: target position (mm)");
     Serial.println("  I2C Servo Control:");
     Serial.println("    - Servo angles (degrees, relative to neutral)");
@@ -538,7 +697,9 @@ void setMotorControl(MotorControl *motor_ctrl, SemaphoreHandle_t semaphore, PIDC
         else if (mode == I2C_MODE_SPEED)
         {
             motor_ctrl->mode = MODE_SPEED_CONTROL;
-            motor_ctrl->target_speed = data_s;
+            motor_ctrl->target_speed_mms = data_s;  // Store mm/s value
+            // Convert mm/s to delta pulse per 20ms: delta = (mm/s * pulse_per_m) / 1000 / 50Hz
+            motor_ctrl->target_speed = (int)((float)data_s * pulse_per_m / 1000.0 / 50.0);
             speedPID.reset();
         }
         else if (mode == I2C_MODE_POSITION)

@@ -19,7 +19,7 @@
 
 // I2C Protocol: Motor control modes
 #define I2C_MODE_PWM 0x00                   // Direct PWM control
-#define I2C_MODE_SPEED 0x01                 // Speed PID control (m/s)
+#define I2C_MODE_SPEED 0x01                 // Speed PID control (mm/s)
 #define I2C_MODE_POSITION 0x02              // Position PID control (mm)
 
 class I2CComm
